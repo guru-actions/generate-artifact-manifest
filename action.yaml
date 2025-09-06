@@ -1,0 +1,78 @@
+apiVersion: automation.cloudbees.io/v1alpha1
+kind: action
+name: generate-artifact-manifest
+description: Generates a YAML manifest of latest artifacts for a list of components.
+
+inputs:
+  cb_api_url:
+    required: true
+  cb_pat:
+    required: true
+  component_ids:
+    required: true
+    description: Comma-separated list of component IDs (e.g. id1,id2)
+  labels:
+    required: true
+    description: Label filters to apply (e.g. rel=squid-ui,ns=squid-prod)
+
+outputs:
+  manifest:
+    description: YAML-formatted artifact manifest with IDs, versions, timestamps, and names
+    value: ${{ steps.generate.outputs.manifest }}
+
+runs:
+  using: composite
+  steps:
+    - id: generate
+      name: Generate artifact manifest
+      uses: docker://python:3.11-alpine
+      shell: sh
+      env:
+        CB_API_URL: ${{ inputs.cb_api_url }}
+        CB_PAT: ${{ inputs.cb_pat }}
+        COMPONENT_IDS: ${{ inputs.component_ids }}
+        LABELS: ${{ inputs.labels }}
+      run: |
+        apk add --no-cache curl jq yq > /dev/null
+
+        echo "🔍 Fetching latest artifacts for: $COMPONENT_IDS"
+        IFS=',' read -ra IDS <<< "$COMPONENT_IDS"
+
+        echo "" > manifest.yaml
+
+        for COMPONENT_ID in "${IDS[@]}"; do
+          echo "Fetching for component: $COMPONENT_ID"
+          curl -s -H "Authorization: Bearer $CB_PAT" \
+            "$CB_API_URL/v3/components/$COMPONENT_ID/artifactinfos" > response.json
+
+          FILTER=$(echo "$LABELS" | awk -F, '
+            {
+              for (i = 1; i <= NF; i++) {
+                split($i, kv, "=")
+                printf "(.labels | index(\"%s=%s\")) and ", kv[1], kv[2]
+              }
+            }' | sed 's/ and $//')
+
+          MATCH=$(jq -r ".artifacts[] | select($FILTER) | \"\(.id) \(.version) \(.publishedOn) \(.name)\"" response.json | head -n 1)
+
+          if [ -z "$MATCH" ]; then
+            echo "No artifact found for $COMPONENT_ID"
+            continue
+          fi
+
+          ARTIFACT_ID=$(echo "$MATCH" | awk '{print $1}')
+          VERSION=$(echo "$MATCH" | awk '{print $2}')
+          TIMESTAMP=$(echo "$MATCH" | awk '{print $3}')
+          ARTIFACT_NAME=$(echo "$MATCH" | cut -d' ' -f4-)
+
+          echo "$COMPONENT_ID:" >> manifest.yaml
+          echo "  artifact_id: \"$ARTIFACT_ID\"" >> manifest.yaml
+          echo "  version: \"$VERSION\"" >> manifest.yaml
+          echo "  timestamp: \"$TIMESTAMP\"" >> manifest.yaml
+          echo "  artifact_name: \"$ARTIFACT_NAME\"" >> manifest.yaml
+        done
+
+        echo "✅ Generated manifest:"
+        cat manifest.yaml
+
+        cat manifest.yaml > "$CLOUDBEES_OUTPUTS/manifest"
