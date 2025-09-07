@@ -41,8 +41,13 @@ runs:
         
         for COMPONENT_ID in $(echo "$COMPONENT_IDS" | tr ',' ' '); do
           echo "Fetching for component: $COMPONENT_ID"
-          curl -s -H "Authorization: Bearer $CB_PAT" \
-            "$CB_API_URL/v3/components/$COMPONENT_ID/artifactinfos" > response.json
+          STATUS=$(curl -s -w "%{http_code}" -o response.json \
+            -H "Authorization: Bearer $CB_PAT" \
+            "$CB_API_URL/v3/components/$COMPONENT_ID/artifactinfos")
+          
+          echo "🔍 [$COMPONENT_ID] HTTP Status: $STATUS"
+          echo "🔍 [$COMPONENT_ID] Response JSON:"
+          cat response.json
           echo "🔍 Appying filters"
           FILTER=$(echo "$LABELS" | awk -F, '
             {
