@@ -37,9 +37,9 @@ runs:
 
         echo "🔍 Fetching latest artifacts for: $COMPONENT_IDS"
         IFS=',' read -ra IDS <<< "$COMPONENT_IDS"
-
+        echo "🔍 Creating blank mamnifest"
         echo "" > manifest.yaml
-
+        echo "🔍 Done creating blank manifest"
         for COMPONENT_ID in "${IDS[@]}"; do
           echo "Fetching for component: $COMPONENT_ID"
           curl -s -H "Authorization: Bearer $CB_PAT" \
