@@ -43,7 +43,7 @@ runs:
           echo "Fetching for component: $COMPONENT_ID"
           curl -s -H "Authorization: Bearer $CB_PAT" \
             "$CB_API_URL/v3/components/$COMPONENT_ID/artifactinfos" > response.json
-        
+          echo "🔍 Appying filters"
           FILTER=$(echo "$LABELS" | awk -F, '
             {
               for (i = 1; i <= NF; i++) {
@@ -51,9 +51,9 @@ runs:
                 printf "(.labels | index(\"%s=%s\")) and ", kv[1], kv[2]
               }
             }' | sed 's/ and $//')
-        
+          echo "🔍 Appying match"
           MATCH=$(jq -r ".artifacts[] | select($FILTER) | \"\(.id) \(.version) \(.publishedOn) \(.name)\"" response.json | head -n 1)
-        
+          echo "🔍 Finished appying filters"
           if [ -z "$MATCH" ]; then
             echo "No artifact found for $COMPONENT_ID"
             continue
