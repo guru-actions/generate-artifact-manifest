@@ -19,6 +19,9 @@ outputs:
   manifest:
     description: YAML-formatted artifact manifest with IDs, versions, timestamps, and names
     value: ${{ steps.generate.outputs.manifest }}
+  errors:
+    description: JSON-formatted list of components that failed to fetch
+    value: ${{ steps.generate.outputs.errors }}
 
 runs:
   using: composite
@@ -37,18 +40,23 @@ runs:
 
         echo "🔍 Fetching latest artifacts for: $COMPONENT_IDS"
         echo "" > manifest.yaml
-        echo "🔍 Created blank manifest"
-        
+        echo '{"errors":[]}' > errors.json
+        echo "🔍 Created blank manifest and error file"
+
         for COMPONENT_ID in $(echo "$COMPONENT_IDS" | tr ',' ' '); do
-          echo "Fetching for component: $COMPONENT_ID"
+          echo "📦 Fetching for component: $COMPONENT_ID"
           STATUS=$(curl -s -w "%{http_code}" -o response.json \
             -H "Authorization: Bearer $CB_PAT" \
             "$CB_API_URL/v3/components/$COMPONENT_ID/artifactinfos")
-          
-          echo "🔍 [$COMPONENT_ID] HTTP Status: $STATUS"
-          echo "🔍 [$COMPONENT_ID] Response JSON:"
-          cat response.json
-          echo "🔍 Appying filters"
+
+          if [ "$STATUS" -ne 200 ]; then
+            echo "❌ Component fetch failed for $COMPONENT_ID (HTTP $STATUS)"
+            jq --arg id "$COMPONENT_ID" --arg status "$STATUS" \
+              '.errors += [{"component_id": $id, "status": ($status | tonumber), "message": "Component fetch failed"}]' \
+              errors.json > tmp.json && mv tmp.json errors.json
+            continue
+          fi
+
           FILTER=$(echo "$LABELS" | awk -F, '
             {
               for (i = 1; i <= NF; i++) {
@@ -56,27 +64,36 @@ runs:
                 printf "(.labels | index(\"%s=%s\")) and ", kv[1], kv[2]
               }
             }' | sed 's/ and $//')
-          echo "🔍 Appying match"
+
           MATCH=$(jq -r ".artifacts[] | select($FILTER) | \"\(.id) \(.version) \(.publishedOn) \(.name)\"" response.json | head -n 1)
-          echo "🔍 Finished appying filters"
+
           if [ -z "$MATCH" ]; then
-            echo "No artifact found for $COMPONENT_ID"
+            echo "⚠️  No matching artifact found for $COMPONENT_ID (valid component)"
+            echo "$COMPONENT_ID:" >> manifest.yaml
+            echo "  artifact_id: null" >> manifest.yaml
+            echo "  version: null" >> manifest.yaml
+            echo "  timestamp: null" >> manifest.yaml
+            echo "  artifact_name: null" >> manifest.yaml
             continue
           fi
-        
+
           ARTIFACT_ID=$(echo "$MATCH" | awk '{print $1}')
           VERSION=$(echo "$MATCH" | awk '{print $2}')
           TIMESTAMP=$(echo "$MATCH" | awk '{print $3}')
           ARTIFACT_NAME=$(echo "$MATCH" | cut -d' ' -f4-)
-        
+
           echo "$COMPONENT_ID:" >> manifest.yaml
           echo "  artifact_id: \"$ARTIFACT_ID\"" >> manifest.yaml
           echo "  version: \"$VERSION\"" >> manifest.yaml
           echo "  timestamp: \"$TIMESTAMP\"" >> manifest.yaml
           echo "  artifact_name: \"$ARTIFACT_NAME\"" >> manifest.yaml
         done
-        
-        echo "✅ Generated manifest:"
+
+        echo "✅ Final Manifest:"
         cat manifest.yaml
-        
+        echo "📋 Final Errors:"
+        cat errors.json
+
+        # Write outputs
         cat manifest.yaml > "$CLOUDBEES_OUTPUTS/manifest"
+        cat errors.json > "$CLOUDBEES_OUTPUTS/errors"
