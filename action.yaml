@@ -43,20 +43,21 @@ runs:
         set -eu
         apk add --no-cache curl jq coreutils > /dev/null
 
-        echo "🔍 Fetching latest artifacts for: $COMPONENT_IDS"
+        LOG() { printf "%s\n" "$*" >&2; }
+
+        LOG "🔍 Fetching latest artifacts for: $COMPONENT_IDS"
         : > manifest.yaml
         echo '{"errors":[]}' > errors.json
         mkdir -p .cache
-        echo "🔍 Created blank manifest, error file, and cache dir"
 
-        # --- call counters & timers
+        # Counters
         CALL_SEQ=0
         AI_CALLS=0; AI_TIME=0
         OC_CALLS=0; OC_TIME=0
         C_CALLS=0;  C_TIME=0
         TOTAL_TIME=0
 
-        # Build a jq filter that tolerates missing labels
+        # Build label filter
         FILTER=$(echo "$LABELS" | awk -F, '
           BEGIN { first=1 }
           {
@@ -68,18 +69,11 @@ runs:
               first=0
             }
           }')
+        [ -n "$FILTER" ] || FILTER="true"
+        LOG "🔍 Filtering artifacts by labels: $LABELS"
+        LOG "🧮 Using jq filter: $FILTER"
 
-        if [ -z "$FILTER" ]; then
-          echo "ℹ️  No labels provided after parsing; defaulting to match-any artifact"
-          FILTER="true"
-        fi
-
-        echo "🔍 Filtering artifacts by labels: $LABELS"
-        echo "🧮 Using jq filter: $FILTER"
-
-        # Extract a plausible name from a JSON payload
         extract_name_from_json() {
-          # Add a few more likely places someone might stash a display name
           jq -r '
             .component.name
             // .component.displayName
@@ -95,25 +89,21 @@ runs:
           ' "$1" 2>/dev/null || true
         }
 
-        # Timed curl logging both request and response
-        # timed_curl <METHOD> <URL> <OUTFILE>
+        # timed_curl METHOD URL OUTFILE
         timed_curl() {
           _method="$1"; _url="$2"; _out="$3"
           CALL_SEQ=$((CALL_SEQ+1))
-          echo "➡️  CALL ${CALL_SEQ}: ${_method} ${_url}"
-          # note: using GET for all; _method is for log clarity
-          result=$(curl -sS -o "$_out" -w "%{http_code} %{time_total}" \
+          LOG "➡️  CALL ${CALL_SEQ}: (${_method} ${_url})"
+          result="$(curl -sS -o "$_out" -w "%{http_code} %{time_total}" \
             -H "Authorization: Bearer $CB_PAT" \
             -H "Accept: application/json" \
-            "$_url")
-          code=$(echo "$result" | awk '{print $1}')
-          time=$(echo "$result" | awk '{print $2}')
-          echo "⬅️  RESP ${CALL_SEQ}: status=${code} time_s=${time}"
-          # return "code time" via stdout
-          echo "${code} ${time}"
+            "$_url")"
+          code="$(printf "%s" "$result" | awk '{print $1}')"
+          time="$(printf "%s" "$result" | awk '{print $2}')"
+          LOG "⬅️  RESP ${CALL_SEQ}: status=${code} time_s=${time} (${_method} ${_url})"
+          printf "%s %s" "$code" "$time"
         }
 
-        # Name lookup with caching and multiple strategies.
         # get_component_name <id> <artifact_name_if_any>
         get_component_name() {
           _id="$1"
@@ -127,20 +117,18 @@ runs:
           name=""
           source=""
 
-          # A) Try from the last artifactinfos body if present
+          # A) Try artifactinfos body if present
           if [ -f response.json ]; then
-            name="$(extract_name_from_json response.json)"
-            if [ -n "$name" ]; then
-              source="artifactinfos_body"
-            fi
+            n1="$(extract_name_from_json response.json)"
+            if [ -n "$n1" ]; then name="$n1"; source="artifactinfos_body"; fi
           fi
 
-          # B) Org-scoped endpoint (if org provided and still no name)
-          oc_code=""; oc_time="0"
+          # B) Org-scoped
+          oc_code="0"; oc_time="0"
           if [ -z "$name" ] && [ -n "${ORG_ID:-}" ]; then
             oc_line="$(timed_curl GET "$CB_API_URL/v3/organizations/${ORG_ID}/components/${_id}" comp_org.json)"
-            oc_code=$(echo "$oc_line" | awk '{print $1}')
-            oc_time=$(echo "$oc_line" | awk '{print $2}')
+            oc_code="$(printf "%s" "$oc_line" | awk '{print $1}')"
+            oc_time="$(printf "%s" "$oc_line" | awk '{print $2}')"
             TOTAL_TIME=$(awk "BEGIN{print $TOTAL_TIME + $oc_time}")
             OC_CALLS=$((OC_CALLS+1))
             OC_TIME=$(awk "BEGIN{print $OC_TIME + $oc_time}")
@@ -150,12 +138,12 @@ runs:
             fi
           fi
 
-          # C) Global endpoint (if still no name)
-          c_code=""; c_time="0"
+          # C) Global
+          c_code="0"; c_time="0"
           if [ -z "$name" ]; then
             c_line="$(timed_curl GET "$CB_API_URL/v3/components/${_id}" comp.json)"
-            c_code=$(echo "$c_line" | awk '{print $1}')
-            c_time=$(echo "$c_line" | awk '{print $2}')
+            c_code="$(printf "%s" "$c_line" | awk '{print $1}')"
+            c_time="$(printf "%s" "$c_line" | awk '{print $2}')"
             TOTAL_TIME=$(awk "BEGIN{print $TOTAL_TIME + $c_time}")
             C_CALLS=$((C_CALLS+1))
             C_TIME=$(awk "BEGIN{print $C_TIME + $c_time}")
@@ -165,19 +153,18 @@ runs:
             fi
           fi
 
-          # D) Heuristic from artifact_name (e.g., repo/image -> image)
+          # D) Heuristic from artifact_name
           if [ -z "$name" ] && [ -n "$_artifact_name" ]; then
-            name=$(echo "$_artifact_name" | awk -F'/' '{print $NF}')
-            if [ -n "$name" ]; then source="artifact_heuristic"; fi
+            n4="$(printf "%s" "$_artifact_name" | awk -F'/' '{print $NF}')"
+            if [ -n "$n4" ]; then name="$n4"; source="artifact_heuristic"; fi
           fi
 
           # E) Fallback to UUID and record diagnostics
           if [ -z "$name" ]; then
-            name="$_id"
-            source="uuid"
+            name="$_id"; source="uuid"
             jq --arg id "$_id" \
-               --arg oc_code "${oc_code:-0}" --arg oc_time "${oc_time:-0}" \
-               --arg c_code  "${c_code:-0}"  --arg c_time  "${c_time:-0}" \
+               --arg oc_code "$oc_code" --arg oc_time "$oc_time" \
+               --arg c_code  "$c_code"  --arg c_time  "$c_time" \
                '.errors += [{
                  "component_id": $id,
                  "status": 200,
@@ -190,29 +177,30 @@ runs:
                errors.json > tmp.json && mv tmp.json errors.json
           fi
 
+          LOG "ℹ️  Component name source for ${_id}: ${source} -> ${name}"
           printf "%s" "$name" > ".cache/${_id}.name"
-          echo "ℹ️  Component name source for ${_id}: ${source} -> ${name}"
           printf "%s" "$name"
         }
 
         # Main loop
-        for COMPONENT_ID in $(echo "$COMPONENT_IDS" | tr ',' ' '); do
-          echo "📦 Fetching for component: $COMPONENT_ID"
+        IFS_SAVE="$IFS"
+        IFS=','; set -- $COMPONENT_IDS; IFS="$IFS_SAVE"
+        for COMPONENT_ID in "$@"; do
+          LOG "📦 Fetching for component: $COMPONENT_ID"
+          LOG "   (GET $CB_API_URL/v3/components/$COMPONENT_ID/artifactinfos)"
 
           ai_line="$(timed_curl GET "$CB_API_URL/v3/components/$COMPONENT_ID/artifactinfos" response.json)"
-          ai_code=$(echo "$ai_line" | awk '{print $1}')
-          ai_time=$(echo "$ai_line" | awk '{print $2}')
+          ai_code="$(printf "%s" "$ai_line" | awk '{print $1}')"
+          ai_time="$(printf "%s" "$ai_line" | awk '{print $2}')"
           TOTAL_TIME=$(awk "BEGIN{print $TOTAL_TIME + $ai_time}")
           AI_CALLS=$((AI_CALLS+1))
           AI_TIME=$(awk "BEGIN{print $AI_TIME + $ai_time}")
 
           if [ "$ai_code" != "200" ]; then
             cname="$(get_component_name "$COMPONENT_ID")"
-            echo "❌ Component fetch failed for $COMPONENT_ID (HTTP $ai_code, ${ai_time}s)"
             jq --arg id "$COMPONENT_ID" --arg name "$cname" --arg code "$ai_code" --arg t "$ai_time" \
               '.errors += [{"component_id": $id, "component_name": $name, "status": ($code | tonumber), "message": ("Component fetch failed; time_s=" + $t)}]' \
               errors.json > tmp.json && mv tmp.json errors.json
-
             {
               echo "$COMPONENT_ID:"
               echo "  component_name: \"$cname\""
@@ -227,14 +215,11 @@ runs:
 
           MATCH=$(jq -r ".artifacts // [] | .[] | select($FILTER) | \"\(.id) \(.version) \(.publishedOn) \(.name)\"" response.json 2>/dev/null | head -n 1 || true)
           ARTIFACT_NAME=""
-          if [ -n "$MATCH" ]; then
-            ARTIFACT_NAME=$(echo "$MATCH" | cut -d' ' -f4-)
-          fi
+          [ -n "$MATCH" ] && ARTIFACT_NAME="$(printf "%s" "$MATCH" | cut -d' ' -f4-)"
 
           COMPONENT_NAME="$(get_component_name "$COMPONENT_ID" "$ARTIFACT_NAME")"
 
           if [ -z "$MATCH" ]; then
-            echo "⚠️  No matching artifact found for $COMPONENT_ID (labels: $LABELS)"
             {
               echo "$COMPONENT_ID:"
               echo "  component_name: \"$COMPONENT_NAME\""
@@ -244,16 +229,15 @@ runs:
               echo "  timestamp: null"
               echo "  artifact_name: null"
             } >> manifest.yaml
-
             jq --arg id "$COMPONENT_ID" --arg name "$COMPONENT_NAME" --arg labels "$LABELS" \
               '.errors += [{"component_id": $id, "component_name": $name, "status": 200, "message": ("No artifact matched labels: " + $labels)}]' \
               errors.json > tmp.json && mv tmp.json errors.json
             continue
           fi
 
-          ARTIFACT_ID=$(echo "$MATCH" | awk '{print $1}')
-          VERSION=$(echo "$MATCH" | awk '{print $2}')
-          TIMESTAMP=$(echo "$MATCH" | awk '{print $3}')
+          ARTIFACT_ID="$(printf "%s" "$MATCH" | awk '{print $1}')"
+          VERSION="$(printf "%s" "$MATCH" | awk '{print $2}')"
+          TIMESTAMP="$(printf "%s" "$MATCH" | awk '{print $3}')"
 
           {
             echo "$COMPONENT_ID:"
@@ -266,20 +250,12 @@ runs:
           } >> manifest.yaml
         done
 
-        # Final prints (don’t fail if cat has issues)
-        set +e
-        echo "✅ Final Manifest:"
-        cat manifest.yaml
-        echo "📋 Final Errors:"
-        cat errors.json
-
-        # Summary of API usage
-        echo "📈 API CALL SUMMARY"
-        echo "  artifactinfos: calls=${AI_CALLS}, total_time_s=${AI_TIME}"
-        echo "  org/components: calls=${OC_CALLS}, total_time_s=${OC_TIME}"
-        echo "  components:     calls=${C_CALLS}, total_time_s=${C_TIME}"
-        echo "  overall_total_time_s=${TOTAL_TIME}"
-        set -e
+        # Human-readable summary (STDERR)
+        LOG "📈 API CALL SUMMARY"
+        LOG "  artifactinfos: calls=${AI_CALLS}, total_time_s=${AI_TIME}"
+        LOG "  org/components: calls=${OC_CALLS}, total_time_s=${OC_TIME}"
+        LOG "  components:     calls=${C_CALLS}, total_time_s=${C_TIME}"
+        LOG "  overall_total_time_s=${TOTAL_TIME}"
 
         # Outputs
         cat manifest.yaml > "$CLOUDBEES_OUTPUTS/manifest"
