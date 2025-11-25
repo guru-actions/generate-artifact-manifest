@@ -1,4 +1,4 @@
- apiVersion: automation.cloudbees.io/v1alpha1
+apiVersion: automation.cloudbees.io/v1alpha1
 kind: action
 name: generate-artifact-manifest
 description: Generates a YAML manifest of latest artifacts for a list of components.
