@@ -14,13 +14,16 @@ inputs:
   labels:
     required: true
     description: Label filters to apply (e.g. rel=squid-ui,ns=squid-prod)
+  org_id:
+    required: false
+    description: Optional organization ID for org-scoped component lookups
 
 outputs:
   manifest:
     description: YAML-formatted artifact manifest with IDs, versions, timestamps, artifact names, component names, and match status
     value: ${{ steps.generate.outputs.manifest }}
   errors:
-    description: JSON-formatted list of components that failed to fetch or match
+    description: JSON-formatted list of components that failed to fetch or match (and non-fatal name-lookup notes)
     value: ${{ steps.generate.outputs.errors }}
 
 runs:
@@ -35,6 +38,7 @@ runs:
         CB_PAT: ${{ inputs.cb_pat }}
         COMPONENT_IDS: ${{ inputs.component_ids }}
         LABELS: ${{ inputs.labels }}
+        ORG_ID: ${{ inputs.org_id }}
       run: |
         set -euo pipefail
         apk add --no-cache curl jq yq > /dev/null
@@ -46,7 +50,6 @@ runs:
         echo "🔍 Created blank manifest, error file, and cache dir"
 
         # Build a jq filter that tolerates missing labels:
-        # Each label filter becomes: ((.labels // []) | index("k=v")) and ...
         FILTER=$(echo "$LABELS" | awk -F, '
           BEGIN { first=1 }
           {
@@ -67,41 +70,72 @@ runs:
         echo "🔍 Filtering artifacts by labels: $LABELS"
         echo "🧮 Using jq filter: $FILTER"
 
-        # ---- helper: name lookup with caching via /v3/components/{id}
+        # ---- helper: try to read a component name from a JSON file using multiple common locations
+        _extract_name_from_json () {
+          jq -r '
+            .component.name
+            // .component.displayName
+            // .component.title
+            // .name
+            // .displayName
+            // .title
+            // .metadata.name
+            // .data.name
+            // empty
+          ' "$1" 2>/dev/null || true
+        }
+
+        # ---- helper: name lookup with caching. Tries (1) artifactinfos body, (2) /v3/components/{id},
+        # ---- and (3) /v3/organizations/{orgId}/components/{id} if org_id is provided.
         get_component_name () {
           _id="$1"
+
           # cache hit?
           if [ -f ".cache/${_id}.name" ]; then
             cat ".cache/${_id}.name"
             return 0
           fi
 
-          # canonical lookup
-          status=$(curl -s -w "%{http_code}" -o comp.json \
-            -H "Authorization: Bearer $CB_PAT" \
-            -H "Accept: application/json" \
-            "$CB_API_URL/v3/components/${_id}")
-
-          name=""
-          if [ "$status" -eq 200 ]; then
-            name=$(jq -r '
-              .name
-              // .displayName
-              // .title
-              // .component.name
-              // .metadata.name
-              // .data.name
-              // empty
-            ' comp.json 2>/dev/null || true)
+          # 1) Try the current artifactinfos body if present
+          local n=""
+          if [ -f response.json ]; then
+            n="$(_extract_name_from_json response.json)"
           fi
 
-          if [ -z "${name:-}" ]; then
-            # fallback: ID (also cache to avoid repeated failing calls)
-            name="$_id"
+          # 2) Try global component endpoint
+          local s1="0"
+          if [ -z "${n:-}" ]; then
+            s1=$(curl -s -w "%{http_code}" -o comp.json \
+              -H "Authorization: Bearer $CB_PAT" \
+              -H "Accept: application/json" \
+              "$CB_API_URL/v3/components/${_id}")
+            if [ "$s1" -eq 200 ]; then
+              n="$(_extract_name_from_json comp.json)"
+            fi
           fi
 
-          printf "%s" "$name" > ".cache/${_id}.name"
-          printf "%s" "$name"
+          # 3) Try org-scoped component endpoint if org_id provided and still no name
+          local s2="0"
+          if [ -z "${n:-}" ] && [ -n "${ORG_ID:-}" ]; then
+            s2=$(curl -s -w "%{http_code}" -o comp_org.json \
+              -H "Authorization: Bearer $CB_PAT" \
+              -H "Accept: application/json" \
+              "$CB_API_URL/v3/organizations/${ORG_ID}/components/${_id}")
+            if [ "$s2" -eq 200 ]; then
+              n="$(_extract_name_from_json comp_org.json)"
+            fi
+          fi
+
+          # If still empty, record a soft note and fallback to the UUID
+          if [ -z "${n:-}" ]; then
+            jq --arg id "$_id" --arg s1 "$s1" --arg s2 "$s2" \
+              '.errors += [{"component_id": $id, "status": 200, "message": ("Name lookup fell back to ID (HTTPs: /components=" + $s1 + ", /orgs/components=" + ( $s2 // "0" ) + ")")} ]' \
+              errors.json > tmp.json && mv tmp.json errors.json
+            n="$_id"
+          fi
+
+          printf "%s" "$n" > ".cache/${_id}.name"
+          printf "%s" "$n"
         }
 
         for COMPONENT_ID in $(echo "$COMPONENT_IDS" | tr ',' ' '); do
@@ -131,7 +165,6 @@ runs:
             continue
           fi
 
-          # Safe jq: tolerate missing arrays/labels; never hard-fail on jq errors.
           MATCH=$(jq -r \
             ".artifacts // [] | .[] | select($FILTER) | \"\(.id) \(.version) \(.publishedOn) \(.name)\"" \
             response.json 2>/dev/null | head -n 1 || true)
