@@ -1,4 +1,4 @@
-apiVersion: automation.cloudbees.io/v1alpha1
+ apiVersion: automation.cloudbees.io/v1alpha1
 kind: action
 name: generate-artifact-manifest
 description: Generates a YAML manifest of latest artifacts for a list of components.
@@ -17,7 +17,7 @@ inputs:
 
 outputs:
   manifest:
-    description: YAML-formatted artifact manifest with IDs, versions, timestamps, names, and component names
+    description: YAML-formatted artifact manifest with IDs, versions, timestamps, artifact names, component names, and match status
     value: ${{ steps.generate.outputs.manifest }}
   errors:
     description: JSON-formatted list of components that failed to fetch or match
@@ -42,11 +42,11 @@ runs:
         echo "🔍 Fetching latest artifacts for: $COMPONENT_IDS"
         : > manifest.yaml
         echo '{"errors":[]}' > errors.json
-        echo "🔍 Created blank manifest and error file"
+        mkdir -p .cache
+        echo "🔍 Created blank manifest, error file, and cache dir"
 
         # Build a jq filter that tolerates missing labels:
-        # Each label filter becomes: ((.labels // []) | index("k=v"))
-        # Joined with AND so all labels must be present.
+        # Each label filter becomes: ((.labels // []) | index("k=v")) and ...
         FILTER=$(echo "$LABELS" | awk -F, '
           BEGIN { first=1 }
           {
@@ -67,40 +67,48 @@ runs:
         echo "🔍 Filtering artifacts by labels: $LABELS"
         echo "🧮 Using jq filter: $FILTER"
 
+        # ---- helper: name lookup with caching via /v3/components/{id}
         get_component_name () {
           _id="$1"
+          # cache hit?
+          if [ -f ".cache/${_id}.name" ]; then
+            cat ".cache/${_id}.name"
+            return 0
+          fi
 
-          # 1) Try the component metadata endpoint
-          local status
+          # canonical lookup
           status=$(curl -s -w "%{http_code}" -o comp.json \
             -H "Authorization: Bearer $CB_PAT" \
+            -H "Accept: application/json" \
             "$CB_API_URL/v3/components/${_id}")
 
+          name=""
           if [ "$status" -eq 200 ]; then
-            name=$(jq -r '.name // .component.name // empty' comp.json)
-            if [ -n "${name:-}" ]; then
-              printf "%s" "$name"
-              return 0
-            fi
+            name=$(jq -r '
+              .name
+              // .displayName
+              // .title
+              // .component.name
+              // .metadata.name
+              // .data.name
+              // empty
+            ' comp.json 2>/dev/null || true)
           fi
 
-          # 2) Fallback: try to infer from last artifactinfos response (if present)
-          if [ -f response.json ]; then
-            name=$(jq -r '.component.name // .name // empty' response.json 2>/dev/null || true)
-            if [ -n "${name:-}" ]; then
-              printf "%s" "$name"
-              return 0
-            fi
+          if [ -z "${name:-}" ]; then
+            # fallback: ID (also cache to avoid repeated failing calls)
+            name="$_id"
           fi
 
-          # 3) Last resort: return the ID
-          printf "%s" "$_id"
+          printf "%s" "$name" > ".cache/${_id}.name"
+          printf "%s" "$name"
         }
 
         for COMPONENT_ID in $(echo "$COMPONENT_IDS" | tr ',' ' '); do
           echo "📦 Fetching for component: $COMPONENT_ID"
           STATUS=$(curl -s -w "%{http_code}" -o response.json \
             -H "Authorization: Bearer $CB_PAT" \
+            -H "Accept: application/json" \
             "$CB_API_URL/v3/components/$COMPONENT_ID/artifactinfos")
 
           COMPONENT_NAME="$(get_component_name "$COMPONENT_ID")"
@@ -111,10 +119,10 @@ runs:
               '.errors += [{"component_id": $id, "component_name": $name, "status": ($status | tonumber), "message": "Component fetch failed"}]' \
               errors.json > tmp.json && mv tmp.json errors.json
 
-            # Emit a manifest entry so consumers still see the component
             {
               echo "$COMPONENT_ID:"
               echo "  component_name: \"$COMPONENT_NAME\""
+              echo "  matched: false"
               echo "  artifact_id: null"
               echo "  version: null"
               echo "  timestamp: null"
@@ -124,13 +132,16 @@ runs:
           fi
 
           # Safe jq: tolerate missing arrays/labels; never hard-fail on jq errors.
-          MATCH=$(jq -r ".artifacts // [] | .[] | select($FILTER) | \"\(.id) \(.version) \(.publishedOn) \(.name)\"" response.json 2>/dev/null | head -n 1 || true)
+          MATCH=$(jq -r \
+            ".artifacts // [] | .[] | select($FILTER) | \"\(.id) \(.version) \(.publishedOn) \(.name)\"" \
+            response.json 2>/dev/null | head -n 1 || true)
 
           if [ -z "$MATCH" ]; then
             echo "⚠️  No matching artifact found for $COMPONENT_ID (labels: $LABELS)"
             {
               echo "$COMPONENT_ID:"
               echo "  component_name: \"$COMPONENT_NAME\""
+              echo "  matched: false"
               echo "  artifact_id: null"
               echo "  version: null"
               echo "  timestamp: null"
@@ -151,6 +162,7 @@ runs:
           {
             echo "$COMPONENT_ID:"
             echo "  component_name: \"$COMPONENT_NAME\""
+            echo "  matched: true"
             echo "  artifact_id: \"$ARTIFACT_ID\""
             echo "  version: \"$VERSION\""
             echo "  timestamp: \"$TIMESTAMP\""
