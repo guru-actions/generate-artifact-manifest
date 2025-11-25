@@ -17,7 +17,7 @@ inputs:
 
 outputs:
   manifest:
-    description: YAML-formatted artifact manifest with IDs, versions, timestamps, and names
+    description: YAML-formatted artifact manifest with IDs, versions, timestamps, names, and component names
     value: ${{ steps.generate.outputs.manifest }}
   errors:
     description: JSON-formatted list of components that failed to fetch or match
@@ -36,6 +36,7 @@ runs:
         COMPONENT_IDS: ${{ inputs.component_ids }}
         LABELS: ${{ inputs.labels }}
       run: |
+        set -euo pipefail
         apk add --no-cache curl jq yq > /dev/null
 
         echo "🔍 Fetching latest artifacts for: $COMPONENT_IDS"
@@ -66,27 +67,59 @@ runs:
         echo "🔍 Filtering artifacts by labels: $LABELS"
         echo "🧮 Using jq filter: $FILTER"
 
+        get_component_name () {
+          _id="$1"
+
+          # 1) Try the component metadata endpoint
+          local status
+          status=$(curl -s -w "%{http_code}" -o comp.json \
+            -H "Authorization: Bearer $CB_PAT" \
+            "$CB_API_URL/v3/components/${_id}")
+
+          if [ "$status" -eq 200 ]; then
+            name=$(jq -r '.name // .component.name // empty' comp.json)
+            if [ -n "${name:-}" ]; then
+              printf "%s" "$name"
+              return 0
+            fi
+          fi
+
+          # 2) Fallback: try to infer from last artifactinfos response (if present)
+          if [ -f response.json ]; then
+            name=$(jq -r '.component.name // .name // empty' response.json 2>/dev/null || true)
+            if [ -n "${name:-}" ]; then
+              printf "%s" "$name"
+              return 0
+            fi
+          fi
+
+          # 3) Last resort: return the ID
+          printf "%s" "$_id"
+        }
+
         for COMPONENT_ID in $(echo "$COMPONENT_IDS" | tr ',' ' '); do
           echo "📦 Fetching for component: $COMPONENT_ID"
           STATUS=$(curl -s -w "%{http_code}" -o response.json \
             -H "Authorization: Bearer $CB_PAT" \
             "$CB_API_URL/v3/components/$COMPONENT_ID/artifactinfos")
 
+          COMPONENT_NAME="$(get_component_name "$COMPONENT_ID")"
+
           if [ "$STATUS" -ne 200 ]; then
             echo "❌ Component fetch failed for $COMPONENT_ID (HTTP $STATUS)"
-            jq --arg id "$COMPONENT_ID" --arg status "$STATUS" \
-              '.errors += [{"component_id": $id, "status": ($status | tonumber), "message": "Component fetch failed"}]' \
+            jq --arg id "$COMPONENT_ID" --arg name "$COMPONENT_NAME" --arg status "$STATUS" \
+              '.errors += [{"component_id": $id, "component_name": $name, "status": ($status | tonumber), "message": "Component fetch failed"}]' \
               errors.json > tmp.json && mv tmp.json errors.json
 
-            # Still emit a manifest entry so consumers see the component
+            # Emit a manifest entry so consumers still see the component
             {
               echo "$COMPONENT_ID:"
+              echo "  component_name: \"$COMPONENT_NAME\""
               echo "  artifact_id: null"
               echo "  version: null"
               echo "  timestamp: null"
               echo "  artifact_name: null"
             } >> manifest.yaml
-
             continue
           fi
 
@@ -97,15 +130,15 @@ runs:
             echo "⚠️  No matching artifact found for $COMPONENT_ID (labels: $LABELS)"
             {
               echo "$COMPONENT_ID:"
+              echo "  component_name: \"$COMPONENT_NAME\""
               echo "  artifact_id: null"
               echo "  version: null"
               echo "  timestamp: null"
               echo "  artifact_name: null"
             } >> manifest.yaml
 
-            # Record a structured non-fatal error for visibility
-            jq --arg id "$COMPONENT_ID" --arg labels "$LABELS" \
-              '.errors += [{"component_id": $id, "status": 200, "message": ("No artifact matched labels: " + $labels)}]' \
+            jq --arg id "$COMPONENT_ID" --arg name "$COMPONENT_NAME" --arg labels "$LABELS" \
+              '.errors += [{"component_id": $id, "component_name": $name, "status": 200, "message": ("No artifact matched labels: " + $labels)}]' \
               errors.json > tmp.json && mv tmp.json errors.json
             continue
           fi
@@ -117,6 +150,7 @@ runs:
 
           {
             echo "$COMPONENT_ID:"
+            echo "  component_name: \"$COMPONENT_NAME\""
             echo "  artifact_id: \"$ARTIFACT_ID\""
             echo "  version: \"$VERSION\""
             echo "  timestamp: \"$TIMESTAMP\""
