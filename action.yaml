@@ -20,7 +20,7 @@ outputs:
     description: YAML-formatted artifact manifest with IDs, versions, timestamps, and names
     value: ${{ steps.generate.outputs.manifest }}
   errors:
-    description: JSON-formatted list of components that failed to fetch
+    description: JSON-formatted list of components that failed to fetch or match
     value: ${{ steps.generate.outputs.errors }}
 
 runs:
@@ -39,9 +39,32 @@ runs:
         apk add --no-cache curl jq yq > /dev/null
 
         echo "🔍 Fetching latest artifacts for: $COMPONENT_IDS"
-        echo "" > manifest.yaml
+        : > manifest.yaml
         echo '{"errors":[]}' > errors.json
         echo "🔍 Created blank manifest and error file"
+
+        # Build a jq filter that tolerates missing labels:
+        # Each label filter becomes: ((.labels // []) | index("k=v"))
+        # Joined with AND so all labels must be present.
+        FILTER=$(echo "$LABELS" | awk -F, '
+          BEGIN { first=1 }
+          {
+            for (i = 1; i <= NF; i++) {
+              if ($i == "") continue
+              split($i, kv, "=")
+              if (!first) { printf " and " }
+              printf "(((.labels // []) | index(\"%s=%s\")))", kv[1], kv[2]
+              first=0
+            }
+          }')
+
+        if [ -z "$FILTER" ]; then
+          echo "ℹ️  No labels provided after parsing; defaulting to match-any artifact"
+          FILTER="true"
+        fi
+
+        echo "🔍 Filtering artifacts by labels: $LABELS"
+        echo "🧮 Using jq filter: $FILTER"
 
         for COMPONENT_ID in $(echo "$COMPONENT_IDS" | tr ',' ' '); do
           echo "📦 Fetching for component: $COMPONENT_ID"
@@ -54,26 +77,36 @@ runs:
             jq --arg id "$COMPONENT_ID" --arg status "$STATUS" \
               '.errors += [{"component_id": $id, "status": ($status | tonumber), "message": "Component fetch failed"}]' \
               errors.json > tmp.json && mv tmp.json errors.json
+
+            # Still emit a manifest entry so consumers see the component
+            {
+              echo "$COMPONENT_ID:"
+              echo "  artifact_id: null"
+              echo "  version: null"
+              echo "  timestamp: null"
+              echo "  artifact_name: null"
+            } >> manifest.yaml
+
             continue
           fi
 
-          FILTER=$(echo "$LABELS" | awk -F, '
-            {
-              for (i = 1; i <= NF; i++) {
-                split($i, kv, "=")
-                printf "(.labels | index(\"%s=%s\")) and ", kv[1], kv[2]
-              }
-            }' | sed 's/ and $//')
-
-          MATCH=$(jq -r ".artifacts[] | select($FILTER) | \"\(.id) \(.version) \(.publishedOn) \(.name)\"" response.json | head -n 1)
+          # Safe jq: tolerate missing arrays/labels; never hard-fail on jq errors.
+          MATCH=$(jq -r ".artifacts // [] | .[] | select($FILTER) | \"\(.id) \(.version) \(.publishedOn) \(.name)\"" response.json 2>/dev/null | head -n 1 || true)
 
           if [ -z "$MATCH" ]; then
-            echo "⚠️  No matching artifact found for $COMPONENT_ID (valid component)"
-            echo "$COMPONENT_ID:" >> manifest.yaml
-            echo "  artifact_id: null" >> manifest.yaml
-            echo "  version: null" >> manifest.yaml
-            echo "  timestamp: null" >> manifest.yaml
-            echo "  artifact_name: null" >> manifest.yaml
+            echo "⚠️  No matching artifact found for $COMPONENT_ID (labels: $LABELS)"
+            {
+              echo "$COMPONENT_ID:"
+              echo "  artifact_id: null"
+              echo "  version: null"
+              echo "  timestamp: null"
+              echo "  artifact_name: null"
+            } >> manifest.yaml
+
+            # Record a structured non-fatal error for visibility
+            jq --arg id "$COMPONENT_ID" --arg labels "$LABELS" \
+              '.errors += [{"component_id": $id, "status": 200, "message": ("No artifact matched labels: " + $labels)}]' \
+              errors.json > tmp.json && mv tmp.json errors.json
             continue
           fi
 
@@ -82,11 +115,13 @@ runs:
           TIMESTAMP=$(echo "$MATCH" | awk '{print $3}')
           ARTIFACT_NAME=$(echo "$MATCH" | cut -d' ' -f4-)
 
-          echo "$COMPONENT_ID:" >> manifest.yaml
-          echo "  artifact_id: \"$ARTIFACT_ID\"" >> manifest.yaml
-          echo "  version: \"$VERSION\"" >> manifest.yaml
-          echo "  timestamp: \"$TIMESTAMP\"" >> manifest.yaml
-          echo "  artifact_name: \"$ARTIFACT_NAME\"" >> manifest.yaml
+          {
+            echo "$COMPONENT_ID:"
+            echo "  artifact_id: \"$ARTIFACT_ID\""
+            echo "  version: \"$VERSION\""
+            echo "  timestamp: \"$TIMESTAMP\""
+            echo "  artifact_name: \"$ARTIFACT_NAME\""
+          } >> manifest.yaml
         done
 
         echo "✅ Final Manifest:"
